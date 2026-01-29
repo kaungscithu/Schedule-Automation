@@ -1,0 +1,463 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Auto-Scheduler')
+    .addItem('Generate Schedule', 'generateSmartSchedule')
+    .addToUi();
+}
+
+function generateSmartSchedule() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getSheetByName("Schedule");
+  const refSheet = ss.getSheetByName("1. Ref");
+
+  if (!sourceSheet) { ss.toast("❌ 'Schedule' sheet missing", "Error"); return; }
+  if (!refSheet) { ss.toast("❌ '1. Ref' sheet missing", "Error"); return; }
+
+  // ==========================================
+  // CONFIGURATION
+  // ==========================================
+  const ROW_DATA_START = 4;
+  const ROW_CODES = 1;
+
+  const COL_NAME = 3;        // Column D
+  const COL_SHIFT_START = 5; // Column F
+
+  let COL_SHIFT_END;
+  let COL_BREAKS_START;
+  let HAS_END_COLUMN = false;
+
+  const TIMELINE_START_HOUR = 7;
+  const TIMELINE_HOURS = 30;
+  const SLOT_SIZE_MINUTES = 15; 
+
+  const DISPLAY_OVERRIDES = {
+    "we1": "We",
+    "we30": "We"
+  };
+
+  const START_BUFFER_SLOTS = 4;
+  const END_BUFFER_SLOTS = 4;
+  const DEFAULT_SHIFT_HOURS = 9;
+
+  // ==========================================
+  // LAYOUT DETECTION
+  // ==========================================
+  const checkHeader = sourceSheet.getRange("G3").getValue().toString().toLowerCase().trim();
+
+  if (checkHeader.includes("shift end") || checkHeader === "end") {
+    HAS_END_COLUMN = true;
+    COL_SHIFT_END = 6;
+    COL_BREAKS_START = 7;
+  } else {
+    HAS_END_COLUMN = false;
+    COL_SHIFT_END = null;
+    COL_BREAKS_START = 6;
+  }
+
+  // ==========================================
+  // BUILD DURATION MAP
+  // ==========================================
+  let durationMap = {};
+  const lastRefRow = refSheet.getLastRow();
+  if (lastRefRow >= 11) {
+    const refValues = refSheet.getRange(11, 1, lastRefRow - 10, 3).getValues();
+    refValues.forEach(row => {
+      if (row[0]) {
+        durationMap[row[0].toString().trim().toLowerCase()] = parseInt(row[2]) || 0;
+      }
+    });
+  }
+
+  const lastCol = sourceSheet.getLastColumn();
+  const values = sourceSheet.getDataRange().getDisplayValues();
+  const codeRow = values[ROW_CODES];
+
+  // ==========================================
+  // OUTPUT SHEET SETUP
+  // ==========================================
+  let targetSheet = ss.getSheetByName("Smart_Schedule");
+  if (targetSheet) ss.deleteSheet(targetSheet);
+  targetSheet = ss.insertSheet("Smart_Schedule");
+
+  let timeHeaders = ["Employee", "Shift Start", "Shift End", "Status / Unscheduled"];
+  let timeMap = [];
+  let startMinsBase = TIMELINE_START_HOUR * 60;
+
+  for (let i = 0; i < TIMELINE_HOURS * 4; i++) {
+    let currentMins = startMinsBase + (i * SLOT_SIZE_MINUTES);
+    let h = Math.floor((currentMins / 60) % 24);
+    let m = currentMins % 60;
+    timeHeaders.push(`${h}:${m.toString().padStart(2, "0")}`);
+    timeMap.push({ colIndex: i + 4, minutesAbs: currentMins });
+  }
+  
+  targetSheet.getRange(1, 1, 1, timeHeaders.length)
+    .setValues([timeHeaders])
+    .setFontWeight("bold")
+    .setBackground("#434343")
+    .setFontColor("white")
+    .setHorizontalAlignment("center");
+  
+  targetSheet.setFrozenColumns(4);
+  targetSheet.setColumnWidths(5, timeHeaders.length - 4, 35);
+  targetSheet.setColumnWidth(4, 250);
+
+  let totalHcArray = new Array(timeMap.length).fill(0);
+  let activeHcArray = new Array(timeMap.length).fill(0);
+  let globalHeatMap = new Array(timeMap.length).fill(0);
+  let outputRows = [];
+
+  // ==========================================
+  // PROCESS ROWS
+  // ==========================================
+  for (let r = ROW_DATA_START - 1; r < values.length; r++) {
+    let rowData = values[r];
+    let empName = rowData[COL_NAME];
+    let sStr = rowData[COL_SHIFT_START];
+    
+    if (!empName || !sStr) continue;
+
+    let sMin = parseTime(sStr);
+    let eMin = 0;
+    let eStr = "";
+
+    if (HAS_END_COLUMN && rowData[COL_SHIFT_END]) {
+      eStr = rowData[COL_SHIFT_END];
+      eMin = parseTime(eStr);
+    } else {
+      eMin = sMin + (DEFAULT_SHIFT_HOURS * 60);
+      eStr = formatTime(eMin);
+    }
+    if (eMin < sMin) eMin += 1440;
+
+    let newRow = new Array(timeHeaders.length).fill("");
+    newRow[0] = empName;
+    newRow[1] = sStr;
+    newRow[2] = eStr;
+    newRow[3] = "";
+
+    let validIndices = [];
+    timeMap.forEach((t, i) => {
+      let tMin = t.minutesAbs; 
+      if (tMin >= sMin && tMin < eMin) {
+        validIndices.push(i);
+        totalHcArray[i]++;
+        activeHcArray[i]++; 
+      }
+    });
+
+    if (validIndices.length === 0) {
+      newRow[3] = "❌ Shift Outside Timeline";
+      outputRows.push(newRow);
+      continue;
+    }
+
+    let blocksToSchedule = [];
+
+    // --- 1. PARSE COLUMNS ---
+    for (let c = COL_BREAKS_START; c < lastCol; c++) {
+      let rawCode = codeRow[c];
+      let cellContent = rowData[c];
+
+      if (!rawCode || !cellContent || cellContent === "#N/A" || cellContent === "") continue;
+
+      let cleanCode = rawCode.toString().trim();
+      let duration = durationMap[cleanCode.toLowerCase()] ?? 1;
+      if (duration === 0) continue;
+
+      let key = cleanCode.replace(/\s+/g, "").toLowerCase();
+      let displayCode = DISPLAY_OVERRIDES[key] || cleanCode;
+
+      let fixedStartMin = null;
+      let timeMatch = cellContent.toString().match(/(\d{1,2})[:.](\d{2})/);
+      
+      if (timeMatch) {
+        let rawMin = parseInt(timeMatch[1]) * 60 + parseInt(timeMatch[2]);
+        let remainder = rawMin % SLOT_SIZE_MINUTES;
+        if (remainder < SLOT_SIZE_MINUTES / 2) {
+            fixedStartMin = rawMin - remainder;
+        } else {
+            fixedStartMin = rawMin + (SLOT_SIZE_MINUTES - remainder);
+        }
+      }
+
+      blocksToSchedule.push({
+        code: displayCode,        
+        originalCode: cleanCode,
+        cleanKey: key,
+        duration: duration,
+        fixedStartMin: fixedStartMin,
+        isLunch: key.includes("lu"),
+        isSb: key.includes("sb")
+      });
+    }
+
+    // --- 2. SORTING PRIORITY ---
+    blocksToSchedule.sort((a, b) => {
+      let aStrict = (a.cleanKey === "we1" && a.fixedStartMin !== null);
+      let bStrict = (b.cleanKey === "we1" && b.fixedStartMin !== null);
+      if (aStrict && !bStrict) return -1;
+      if (!aStrict && bStrict) return 1;
+
+      if (a.fixedStartMin !== null && b.fixedStartMin === null) return -1;
+      if (a.fixedStartMin === null && b.fixedStartMin !== null) return 1;
+      if (a.isLunch && !b.isLunch) return -1;
+      if (!a.isLunch && b.isLunch) return 1;
+      return b.duration - a.duration;
+    });
+
+    // --- 3. PLACEMENT LOGIC ---
+    let missedItems = [];
+
+    blocksToSchedule.forEach(b => {
+      let bestStartIdx = -1;
+      let minScore = Infinity;
+      let isShortBreak = b.duration <= 1;
+      let placed = false;
+      let isStrictWe1 = (b.cleanKey === "we1");
+
+      // A) FIXED TIME
+      if (b.fixedStartMin !== null) {
+        let targetMin = b.fixedStartMin;
+        if ((targetMin % 1440) === (eMin % 1440)) {
+           targetMin -= (b.duration * SLOT_SIZE_MINUTES);
+        }
+
+        for (let i = 0; i <= validIndices.length - b.duration; i++) {
+           let idx = validIndices[i];
+           if ((timeMap[idx].minutesAbs % 1440) === (targetMin % 1440)) {
+             let free = true;
+             for (let d = 0; d < b.duration; d++) {
+               if (newRow[timeMap[validIndices[i + d]].colIndex] !== "") free = false;
+             }
+             if (free) {
+               bestStartIdx = i;
+               placed = true;
+             }
+             break;
+           }
+        }
+      }
+
+      // B) FLEXIBLE FALLBACK
+      if (!placed) {
+        if (b.fixedStartMin !== null && isStrictWe1) {
+           missedItems.push(b.originalCode + "(Conflict)");
+           return; 
+        }
+        
+        let shiftCenterIndex = Math.floor(validIndices.length / 2);
+        
+        for (let i = 0; i <= validIndices.length - b.duration; i++) {
+          
+          let free = true;
+          for (let d = 0; d < b.duration; d++) {
+            if (newRow[timeMap[validIndices[i + d]].colIndex] !== "") free = false;
+          }
+          if (!free) continue; 
+
+          let penalty = 0;
+
+          // Buffers
+          if (!isShortBreak && !b.isLunch) {
+            if (i < START_BUFFER_SLOTS) penalty += 2000; 
+            if (i + b.duration > validIndices.length - END_BUFFER_SLOTS) penalty += 2000;
+          }
+
+          // Gap Preference (Left/Right check)
+          let globalStartIdx = validIndices[i];
+          if (globalStartIdx > 0) {
+              let leftCol = timeMap[globalStartIdx - 1].colIndex;
+              if (newRow[leftCol] !== "") penalty += 1000; 
+          }
+          let globalEndIdx = validIndices[i + b.duration - 1];
+          if (globalEndIdx < timeMap.length - 1) {
+              let rightCol = timeMap[globalEndIdx + 1].colIndex;
+              if (newRow[rightCol] !== "") penalty += 1000; 
+          }
+
+          // Specific Sb Logic
+          if (b.isSb) {
+              let prevIdx = validIndices[i] - 1;
+              if (prevIdx >= 0) {
+                let col = timeMap[prevIdx].colIndex;
+                if (newRow[col] === "Sb") penalty += 5000;
+              }
+              let nextIdx = validIndices[i + b.duration - 1] + 1;
+              if (nextIdx < timeMap.length) {
+                let col = timeMap[nextIdx].colIndex;
+                if (newRow[col] === "Sb") penalty += 5000;
+              }
+          }
+
+          let heat = 0;
+          for (let d = 0; d < b.duration; d++) {
+            heat += globalHeatMap[validIndices[i + d]];
+          }
+          let score = heat + penalty;
+          if (b.isLunch) score += (Math.abs(i - shiftCenterIndex) * 10);
+
+          if (score < minScore) {
+            minScore = score;
+            bestStartIdx = i;
+          }
+        }
+        
+        if (bestStartIdx !== -1) placed = true;
+      }
+
+      // WRITE
+      if (placed && bestStartIdx !== -1) {
+        for (let d = 0; d < b.duration; d++) {
+          let idx = validIndices[bestStartIdx + d];
+          let col = timeMap[idx].colIndex;
+          newRow[col] = b.code; 
+          globalHeatMap[idx]++;
+          activeHcArray[idx]--; 
+        }
+      } else if (!placed && !isStrictWe1) {
+         missedItems.push(b.originalCode + "(Full)");
+      }
+    });
+
+    // --- STATUS REPORTING ---
+    if (missedItems.length > 0) {
+      newRow[3] = "⚠️ Failed: " + missedItems.join(", ");
+    } else if (blocksToSchedule.length > 0) {
+      newRow[3] = "✅ All Plotted"; // SUCCESS MESSAGE
+    }
+
+    outputRows.push(newRow);
+  }
+
+  // ==========================================
+  // OUTPUT
+  // ==========================================
+  let rowTotal = new Array(timeHeaders.length).fill("");
+  let rowActive = new Array(timeHeaders.length).fill("");
+
+  rowTotal[0] = "TOTAL HC";
+  rowActive[0] = "ACTIVE HC";
+
+  for (let i = 0; i < timeMap.length; i++) {
+    rowTotal[i + 4] = totalHcArray[i];
+    rowActive[i + 4] = activeHcArray[i];
+  }
+
+  targetSheet.getRange(2, 1, 1, rowTotal.length).setValues([rowTotal])
+    .setFontWeight("bold").setBackground("#d9d9d9");
+  targetSheet.getRange(3, 1, 1, rowActive.length).setValues([rowActive])
+    .setFontWeight("bold").setBackground("#b6d7a8");
+
+  if (outputRows.length) {
+    targetSheet.getRange(4, 1, outputRows.length, outputRows[0].length)
+      .setValues(outputRows);
+
+    let colorBatch = [];
+    let lastTime = "";
+    let currentColor = "#ffffff"; 
+    let altColor = "#e8f0fe"; 
+
+    for (let i = 0; i < outputRows.length; i++) {
+      let thisTime = outputRows[i][1]; 
+      if (thisTime !== lastTime) {
+        currentColor = (currentColor === "#ffffff") ? altColor : "#ffffff";
+        lastTime = thisTime;
+      }
+      colorBatch.push([currentColor, currentColor, currentColor]);
+    }
+    targetSheet.getRange(4, 1, outputRows.length, 3).setBackgrounds(colorBatch);
+
+    applyColors(targetSheet);
+    targetSheet.setFrozenRows(3);
+  }
+
+  ss.toast("✅ Schedule Complete! Please Double Check.", "Success", 5);
+}
+
+// ==========================================
+// HELPERS
+// ==========================================
+function parseTime(str) {
+  if (!str) return 0;
+  let s = str.toString();
+  let match = s.match(/(\d{1,2})[:.](\d{2})/);
+  if (match) {
+    return parseInt(match[1]) * 60 + parseInt(match[2]);
+  }
+  return 0; 
+}
+
+function formatTime(mins) {
+  let h = Math.floor((mins / 60) % 24);
+  let m = mins % 60;
+  return `${h}:${m.toString().padStart(2, "0")}`;
+}
+
+function applyColors(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 4) return;
+  
+  // 1. Grid Rules (Cols E -> End)
+  const gridRange = sheet.getRange(4, 5, lastRow - 3, lastCol - 4);
+  const gridStyles = [
+    { t: "Lu", c: "#fce5cd" },
+    { t: "Sb", c: "#cfe2f3" },
+    { t: "We", c: "#ead1dc" },
+    { t: "CB", c: "#efefef" },
+    { t: "GT", c: "#efefef" }  
+  ];
+  let allRules = gridStyles.map(s =>
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextContains(s.t)
+      .setBackground(s.c)
+      .setFontColor("black")
+      .setRanges([gridRange])
+      .build()
+  );
+
+  // 2. Status Column Rules (Col D)
+  const statusRange = sheet.getRange(4, 4, lastRow - 3, 1);
+  
+  // Success Rule (Green)
+  allRules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextStartsWith("✅")
+      .setFontColor("#38761d")
+      .setBold(true)
+      .setRanges([statusRange])
+      .build()
+  );
+
+  // Failure Rule (Red)
+  allRules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextStartsWith("⚠️")
+      .setFontColor("#cc0000")
+      .setBold(true)
+      .setRanges([statusRange])
+      .build()
+  );
+
+  // Outside Shift Rule (Red)
+  allRules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenTextStartsWith("❌")
+      .setFontColor("#cc0000")
+      .setBold(true)
+      .setRanges([statusRange])
+      .build()
+  );
+
+  sheet.setConditionalFormatRules(allRules);
+}
+
+function onEdit(e) {
+  if (e.range.getSheet().getName() === "Schedule" && 
+      e.range.getA1Notation() === "D1" && 
+      e.range.getValue() === true) {
+    generateSmartSchedule();
+    e.range.setValue(false);
+  }
+}
